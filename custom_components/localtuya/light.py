@@ -275,7 +275,11 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
         if self.has_config(CONF_COLOR):
             color_data = self.dp_value(CONF_COLOR)
-            if is_write_only and not color_data:
+
+            # Prefer RAW for BLE "colour_data_raw" devices:
+            # - write-only BLE with empty color on connect, OR
+            # - DP already contains a 4-byte Base64 value (e.g. AABkZA==, APBkZA==)
+            if (self._write_only and not color_data) or self.__looks_like_b64_4(color_data):
                 self.__to_color = self.__to_color_raw
                 self.__from_color = self.__from_color_raw
             else:
@@ -428,6 +432,16 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             return ColorMode.BRIGHTNESS
 
         return ColorMode.ONOFF
+
+    def __looks_like_b64_4(self, s: str) -> bool:
+        """True if the string is Base64 that decodes to exactly 4 bytes."""
+        if not isinstance(s, str):
+            return False
+        try:
+            b = base64.b64decode(s, validate=True)
+            return len(b) == 4
+        except Exception:
+            return False
 
     def __is_color_rgb_encoded(self):
         # for now we will prefer non encoded if color is none "added by manual or cloud pull dp"
