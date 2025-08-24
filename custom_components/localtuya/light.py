@@ -1,5 +1,6 @@
 """Platform to locally control Tuya-based light devices."""
 
+import binascii, re
 import base64
 import logging
 import textwrap
@@ -39,6 +40,10 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+HEX12 = re.compile(r"^[0-9a-fA-F]{12}$")
+HEX14PLUS = re.compile(r"^[0-9a-fA-F]{14,}$")
 
 DEFAULT_MIN_KELVIN = 2700  # MIRED 370
 DEFAULT_MAX_KELVIN = 6500  # MIRED 153
@@ -143,6 +148,26 @@ SCENE_LIST_RGBW_BLE = {
 }
 
 
+def _detect_color_format(s: str | None):
+    """
+    Returns 'raw-b64' | 'v2-hex' | 'rgbmeta-hex' | None
+    """
+    if not s:
+        return None
+    # Try Base64 4-byte raw: must decode to exactly 4 bytes
+    try:
+        b = base64.b64decode(s, validate=True)
+        if len(b) == 4:
+            return "raw-b64"
+    except binascii.Error:
+        pass
+        # Pure hex checks
+    if HEX12.fullmatch(s):
+        return "v2-hex"
+    if HEX14PLUS.fullmatch(s):
+        return "rgbmeta-hex"
+    return None
+
 @dataclass(frozen=True)
 class Mode:
     color: str = MODE_COLOR
@@ -227,7 +252,9 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             self._config.get(CONF_BRIGHTNESS_UPPER, DEFAULT_UPPER_BRIGHTNESS)
         )
         self._brightness = None if not self._write_only else self._upper_brightness
-        self._upper_color_temp = self._upper_brightness
+        self._lower_temp = 0
+        self._upper_temp = 1000
+        self._last_mode_cmd = None 
 
         self._color_temp_reverse = self._config.get(CONF_COLOR_TEMP_REVERSE, False)
         self._modes = MAP_MODE_SET[int(self._config.get(CONF_COLOR_MODE_SET, 0))]
@@ -274,17 +301,8 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             self._effect_list = list(scenes.keys()) + self._effect_list
 
         if self.has_config(CONF_COLOR):
-            color_data = self.dp_value(CONF_COLOR)
-
-            # Prefer RAW for BLE "colour_data_raw" devices:
-            # - write-only BLE with empty color on connect, OR
-            # - DP already contains a 4-byte Base64 value (e.g. AABkZA==, APBkZA==)
-            if (self._write_only and not color_data) or self.__looks_like_b64_4(color_data):
-                self.__to_color = self.__to_color_raw
-                self.__from_color = self.__from_color_raw
-            else:
-                self.__to_color = self.__to_color_common
-                self.__from_color = self.__from_color_common
+            self.__to_color = self.__to_color_raw
+            self.__from_color = self.__from_color_raw
 
         if is_write_only and self._cached_status:
             self._status.update(self._cached_status)
@@ -333,12 +351,10 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
     @property
     def color_temp_kelvin(self):
-        """Return the color_temp of the light."""
         if self._color_temp is not None:
             return map_range(
                 self._color_temp,
-                self._lower_brightness,
-                self._upper_brightness,
+                0, 1000,  # native DP
                 self.min_color_temp_kelvin,
                 self.max_color_temp_kelvin,
                 self._color_temp_reverse,
@@ -433,20 +449,9 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
         return ColorMode.ONOFF
 
-    def __looks_like_b64_4(self, s: str) -> bool:
-        """True if the string is Base64 that decodes to exactly 4 bytes."""
-        if not isinstance(s, str):
-            return False
-        try:
-            b = base64.b64decode(s, validate=True)
-            return len(b) == 4
-        except Exception:
-            return False
-
     def __is_color_rgb_encoded(self):
-        # for now we will prefer non encoded if color is none "added by manual or cloud pull dp"
         color = self.dp_value(CONF_COLOR)
-        return False if color is None else len(color) > 12
+        return bool(color and HEX14PLUS.fullmatch(color))
 
     def __find_scene_by_scene_data(self, data):
         return (
@@ -532,13 +537,13 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         self._brightness = value
 
     def __from_color_common(self, color: str):
-        """Convert a string to HSL values."""
         if self.__is_color_rgb_encoded():
             hue = int(color[6:10], 16)
             sat = int(color[10:12], 16)
-            value = int(color[12:14], 16)
+            value = int(color[12:14], 16)  # 0..255
             self._hs = [hue, (sat * 100 / 255)]
-            self._brightness = value
+            # Map 0..255 to device brightness range
+            self._brightness = map_range(value, 0, 255, self._lower_brightness, self._upper_brightness)
         else:
             self.__from_color_v2(color)
 
@@ -547,123 +552,168 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         states = {}
         if not self.is_on or self._write_only:
             states[self._dp_id] = True
+    
+        # Helper: HA 0..255 -> device brightness range
+        def _map_bri(x):
+            return max(
+                map_range(int(x), 0, 255, self._lower_brightness, self._upper_brightness),
+                self._lower_brightness,
+            )
+    
+        # Guess current mode: prefer our last command when device doesn't report
+        reported_mode = self.dp_value(CONF_COLOR_MODE) if self.has_config(CONF_COLOR_MODE) else None
+        current_mode = self._last_mode_cmd or reported_mode or self._modes.white
+    
+        # ---------- Explicit HS COLOR ----------
+        if ATTR_HS_COLOR in kwargs and ColorMode.HS in self.supported_color_modes:
+            dev_bri = _map_bri(kwargs.get(ATTR_BRIGHTNESS, self.brightness or 255))
+            self._last_set_bri = dev_bri
+            hs = kwargs[ATTR_HS_COLOR]
+            self._hs = list(hs)
+            self._brightness = dev_bri
+            # some BLE stacks prefer explicit mode before color
+            if self.has_config(CONF_COLOR_MODE):
+                states[self._config.get(CONF_COLOR_MODE)] = self._modes.color
+            states[self._config.get(CONF_COLOR)] = self.__to_color(hs, dev_bri)
+            self._last_mode_cmd = self._modes.color
+            await self._device.set_dps(states)
+            self.async_write_ha_state()
+            return
+    
+        # ---------- Explicit COLOR TEMPERATURE (CCT) ----------
+        if ATTR_COLOR_TEMP_KELVIN in kwargs and ColorMode.COLOR_TEMP in self.supported_color_modes:
+            dev_bri = _map_bri(kwargs.get(ATTR_BRIGHTNESS, self.brightness or 255))
+            self._last_set_bri = dev_bri
+            kelvin = int(kwargs[ATTR_COLOR_TEMP_KELVIN])
+            temp_dp = map_range(
+                kelvin,
+                self.min_color_temp_kelvin,
+                self.max_color_temp_kelvin,
+                0, 1000,               # Tuya temp DP native range
+                self._color_temp_reverse,
+            )
+    
+            # (1) Force work_mode='white' FIRST, as Tuya app does
+            if self.has_config(CONF_COLOR_MODE):
+                await self._device.set_dp(self._modes.white, self._config.get(CONF_COLOR_MODE))
+    
+            # (2) Then set temp (and brightness if present) in a second call
+            write2 = { self._config.get(CONF_COLOR_TEMP): temp_dp }
+            if self.has_config(CONF_BRIGHTNESS) and dev_bri is not None:
+                write2[self._config.get(CONF_BRIGHTNESS)] = dev_bri
+                self._brightness = dev_bri
+            await self._device.set_dps(write2)
+            self.async_write_ha_state()
+            self._last_mode_cmd = self._modes.white
+            return
+    
+        # ---------- BRIGHTNESS ONLY ----------
+        if ATTR_BRIGHTNESS in kwargs and ATTR_HS_COLOR not in kwargs and ATTR_COLOR_TEMP_KELVIN not in kwargs:
+            dev_bri = _map_bri(kwargs[ATTR_BRIGHTNESS])
+            self._last_set_bri = dev_bri
+            self._brightness = dev_bri
+    
+            if current_mode == self._modes.color and self._hs is not None and ColorMode.HS in self.supported_color_modes:
+                # Stay in COLOR: update V via color payload (do NOT flip to white)
+                states[self._config.get(CONF_COLOR)] = self.__to_color(self._hs, dev_bri)
+                # don't touch color_mode; keep current color mode
+                self._last_mode_cmd = self._modes.color
+            else:
+                # Stay in WHITE: update brightness DP only
+                if self.has_config(CONF_BRIGHTNESS):
+                    states[self._config.get(CONF_BRIGHTNESS)] = dev_bri
+                if self.has_config(CONF_COLOR_MODE):
+                    states[self._config.get(CONF_COLOR_MODE)] = self._modes.white
+                self._last_mode_cmd = self._modes.white
+    
+            if states:
+                await self._device.set_dps(states)
+                self.async_write_ha_state()
+            return
+    
+        # ---------- EFFECTS / SCENES / MUSIC (optional path) ----------
         features = self.supported_features
-        color_modes = self.supported_color_modes
-        brightness = None
-        color_mode = None
         if ATTR_EFFECT in kwargs and (features & LightEntityFeature.EFFECT):
             effect = kwargs[ATTR_EFFECT]
             scene = self._scenes.to_tuya(effect)
             if scene is not None:
-                if scene.startswith(self._modes.scene) or scene in (
-                    self._modes.white,
-                    self._modes.color,
-                ):
-                    color_mode = scene
-                else:
-                    color_mode = self._modes.scene
+                mode = scene if (scene.startswith(self._modes.scene) or scene in (self._modes.white, self._modes.color)) else self._modes.scene
+                if mode == self._modes.scene and self.has_config(CONF_SCENE):
                     states[self._config.get(CONF_SCENE)] = scene
-            elif effect in self._modes.as_list():
-                color_mode = effect
-            elif effect == self._modes.music:
-                color_mode = self._modes.music
+                if self.has_config(CONF_COLOR_MODE):
+                    states[self._config.get(CONF_COLOR_MODE)] = mode
+                self._last_mode_cmd = mode
+                await self._device.set_dps(states)
+                self.async_write_ha_state()
+                return
+    
+        # ---------- WHITE shortcut ----------
+        if ATTR_WHITE in kwargs and ColorMode.WHITE in self.supported_color_modes:
+            dev_bri = _map_bri(kwargs.get(ATTR_BRIGHTNESS, self.brightness or 255))
+            self._last_set_bri = dev_bri
+            if self.has_config(CONF_BRIGHTNESS):
+                states[self._config.get(CONF_BRIGHTNESS)] = dev_bri
+                self._brightness = dev_bri
+            if self.has_config(CONF_COLOR_MODE):
+                states[self._config.get(CONF_COLOR_MODE)] = self._modes.white
+            self._last_mode_cmd = self._modes.white
+            await self._device.set_dps(states)
+            self.async_write_ha_state()
+            return
+    
+        # If no specific kwargs matched, just turn on (handled at top)
+        if states:
+            await self._device.set_dps(states)
 
-        if ATTR_BRIGHTNESS in kwargs and (
-            ColorMode.BRIGHTNESS in color_modes
-            or self.has_config(CONF_BRIGHTNESS)
-            or self.has_config(CONF_COLOR)
-        ):
-            brightness = map_range(
-                int(kwargs[ATTR_BRIGHTNESS]),
-                0,
-                255,
-                self._lower_brightness,
-                self._upper_brightness,
-            )
-            brightness = max(brightness, self._lower_brightness)
-
-            if self.is_color_mode and self._hs is not None:
-                states[self._config.get(CONF_COLOR)] = self.__to_color(
-                    self._hs, brightness
-                )
-                color_mode = self._modes.color
-            else:
-                states[self._config.get(CONF_BRIGHTNESS)] = brightness
-                color_mode = self._modes.white
-
-        if ATTR_HS_COLOR in kwargs and ColorMode.HS in color_modes:
-            if brightness is None:
-                brightness = self._brightness
-            hs = kwargs[ATTR_HS_COLOR]
-            if hs[1] == 0 and self.has_config(CONF_BRIGHTNESS):
-                states[self._config.get(CONF_BRIGHTNESS)] = brightness
-                color_mode = self._modes.white
-            else:
-                states[self._config.get(CONF_COLOR)] = self.__to_color(hs, brightness)
-                color_mode = self._modes.color
-
-        if ATTR_COLOR_TEMP_KELVIN in kwargs and ColorMode.COLOR_TEMP in color_modes:
-            if brightness is None:
-                brightness = self._brightness
-
-            color_temp = map_range(
-                int(kwargs[ATTR_COLOR_TEMP_KELVIN]),
-                self.min_color_temp_kelvin,
-                self.max_color_temp_kelvin,
-                self._lower_brightness,
-                self._upper_color_temp,
-                self._color_temp_reverse,
-            )
-
-            color_mode = self._modes.white
-            states[self._config.get(CONF_BRIGHTNESS)] = brightness
-            states[self._config.get(CONF_COLOR_TEMP)] = color_temp
-
-        if ATTR_WHITE in kwargs and ColorMode.WHITE in color_modes:
-            if brightness is None:
-                brightness = self._brightness
-            color_mode = self._modes.white
-            states[self._config.get(CONF_BRIGHTNESS)] = brightness
-
-        if color_mode is not None:
-            states[self._config.get(CONF_COLOR_MODE)] = color_mode
-
-        await self._device.set_dps(states)
 
     async def async_turn_off(self, **kwargs):
         """Turn Tuya light off."""
         await self._device.set_dp(False, self._dp_id)
-
+        self.async_write_ha_state()
+        
     def status_updated(self):
         """Device status was updated."""
         self._state = self.dp_value(self._dp_id)
         supported = self.supported_features
         self._effect = None
-
-        if (brightness_dp_value := self.dp_value(CONF_BRIGHTNESS)) is not None:
-            self._brightness = brightness_dp_value
-
+    
+        # Track reported work_mode if device provides it
+        if self.has_config(CONF_COLOR_MODE):
+            reported = self.dp_value(CONF_COLOR_MODE)
+            if reported in (self._modes.white, self._modes.color, self._modes.scene, self._modes.music):
+                self._last_mode_cmd = reported
+    
+        # -------- WHITE brightness DP (authoritative only in white mode) --------
+        bri_dp = self.dp_value(CONF_BRIGHTNESS)
+        if bri_dp is not None and (self.is_white_mode or ColorMode.HS not in self.supported_color_modes):
+            self._brightness = bri_dp
+    
+        # -------- COLOR (RAW base64) --------
         if ColorMode.HS in self.supported_color_modes:
             color = self.dp_value(CONF_COLOR)
-            if color is not None and not self.is_white_mode:
-                self.__from_color(color)
-            elif self._brightness is None:
-                self._brightness = self._upper_brightness
-
+            if color and not self.is_white_mode:
+                try:
+                    self.__from_color_raw(color)  # sets self._hs and self._brightness
+                except Exception as e:
+                    _LOGGER.debug("raw colour decode failed: %s (payload=%r)", e, color)
+    
+        # -------- If nothing reported (common on BLE), keep last set value --------
+        if self._state and self._brightness is None and getattr(self, "_last_set_bri", None) is not None:
+            self._brightness = self._last_set_bri
+    
+        # -------- Color Temperature DP (0..1000) --------
         if ColorMode.COLOR_TEMP in self.supported_color_modes:
             self._color_temp = self.dp_value(CONF_COLOR_TEMP)
-
+    
+        # -------- Scene / Music effects --------
         if self.is_scene_mode and supported & LightEntityFeature.EFFECT:
             color_mode = self.dp_value(CONF_COLOR_MODE)
             if color_mode != self._modes.scene:
                 self._effect = self.__find_scene_by_scene_data(color_mode)
             else:
-                self._effect = self.__find_scene_by_scene_data(
-                    self.dp_value(CONF_SCENE)
-                )
-                if self._effect is None:
-                    self._effect = self.__find_scene_by_scene_data(color_mode)
-
+                self._effect = self.__find_scene_by_scene_data(self.dp_value(CONF_SCENE)) or \
+                               self.__find_scene_by_scene_data(color_mode)
+    
         if self.is_music_mode and supported & LightEntityFeature.EFFECT:
             self._effect = SCENE_MUSIC
 
@@ -681,3 +731,4 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
 
 async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaLight, flow_schema)
+
